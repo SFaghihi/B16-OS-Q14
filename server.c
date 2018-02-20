@@ -31,6 +31,7 @@ typedef struct serv_proc_args {
     pthread_mutex_t *mutex;
     sem_t *end_proc;
     pid_t child;
+    int *status;
 } serv_proc_args;
 
 void server_process_input(serv_proc_args *arg)
@@ -124,6 +125,10 @@ void server_process_output(serv_proc_args *arg)
             *(arg->is_running) = 0;
             sem_post(arg->end_proc);
             pthread_exit((void *)-4);
+        }
+        if (waitpid(arg->child, arg->status, WNOHANG) > 0) {
+            *(arg->is_running) = 0;
+            sem_post(arg->end_proc);
         }
         pthread_exit((void *)0);
     } else {
@@ -241,6 +246,7 @@ void serv_request(struct serv_args *arg)
         goto Thread_Exit;
     }
     
+    int status = 0;
     /* Setup socket -> pipline threads */
     // STDIN
     pthread_t stdin_proc; int in_is_running = 1;
@@ -253,6 +259,7 @@ void serv_request(struct serv_args *arg)
     serv_proc_args stdout_arg; stdout_arg.mutex = req_mutex; stdout_arg.is_running = &out_is_running;
     stdout_arg.socket = sckt; stdout_arg.pipe = stdout_pipe[0]; stdout_arg.end_proc = end_proc;
     stdout_arg.type = CONN_STDOUT; stdout_arg.eof_type = CONN_STDOUT_EOF;
+    stdout_arg.status = &status; stdout_arg.child = child_pid;
     pthread_create(&stdout_proc, NULL, (void *(*)(void *))&server_process_output, &stdout_arg);
     
     // STDERR
@@ -260,6 +267,7 @@ void serv_request(struct serv_args *arg)
     serv_proc_args stderr_arg; stderr_arg.mutex = req_mutex; stderr_arg.is_running = &err_is_running;
     if (start_req.data_flag == CONN_CMD_STDERR) {
         err_is_running = 1;
+        stderr_arg.status = &status; stderr_arg.child = child_pid;
         stderr_arg.socket = sckt; stderr_arg.pipe = stderr_pipe[0]; stderr_arg.end_proc = end_proc;
         stderr_arg.type = CONN_STDERR; stderr_arg.eof_type = CONN_STDERR_EOF;
         pthread_create(&stderr_proc, NULL, (void *(*)(void *))&server_process_output, &stderr_arg);
@@ -303,12 +311,15 @@ void serv_request(struct serv_args *arg)
         }
     }
     
-    int status;
     pid_t wait_stat = 0;
-    for (int i = 0; i < 10; i++) {
-        if ((wait_stat = waitpid(child_pid, &status, WUNTRACED | WNOHANG)))
-            break;
-        usleep(1000);
+    if (!status) {
+        for (int i = 0; i < 10; i++) {
+            if ((wait_stat = waitpid(child_pid, &status, WUNTRACED | WNOHANG)))
+                break;
+            usleep(1000);
+        }
+    } else {
+        wait_stat = 1;
     }
     /*
     pthread_mutex_lock(req_mutex);
@@ -374,7 +385,7 @@ Thread_Exit:;
 
 void server_stop(int sig)
 {
-    write(STDERR_FILENO, "KILLED WITH SIG", strlen("KILLED WITH SIG"));
+    write(STDERR_FILENO, "KILLED WITH SIG\n", strlen("KILLED WITH SIG\n"));
     if (main_socket > 0)
         close(main_socket);
 }
@@ -482,13 +493,14 @@ int server_routine(const char *addr, const char *port)
     
     /* Wait for all threads to finish */
     for (size_t i = 0; i < MAX_SIML_CONNS; i++) {
-        if (sem_post(threads_info[i].end_proc)) {
+        if (threads_info[i].end_proc && sem_post(threads_info[i].end_proc)) {
             if (threads_info[i].thread_id)
                 pthread_join(threads_info[i].thread_id, NULL);
         } else
             if (threads_info[i].thread_id)
                 pthread_cancel(threads_info[i].thread_id);
-        sem_close(threads_info[i].end_proc);
+        if (threads_info[i].end_proc)
+            sem_close(threads_info[i].end_proc);
         snprintf(sem_name, 100, "/q14%dt%d", getpid(), (int)i);
         sem_unlink(sem_name);
     }

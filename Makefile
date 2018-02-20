@@ -1,7 +1,7 @@
 TARGET = q14
 LIBS = -lm -lpthread
 CC = gcc
-CFLAGS = -g -Wall -pthread 
+CFLAGS = -g -Wall -pthread -std=gnu99
 LDFLAGS = 
 
 .PHONY: default all clean
