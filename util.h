@@ -23,6 +23,8 @@
 #include <netdb.h>
 #include <pthread.h>
 #include <signal.h>
+#include <semaphore.h>
+#include <fcntl.h>
 
 // Metadata type
 typedef enum data_flag_t {
@@ -35,7 +37,8 @@ typedef enum data_flag_t {
     CONN_STDERR,
     CONN_STDERR_EOF,
     CONN_CMD_CLOSE,
-    CONN_CMD_SIG
+    CONN_CMD_SIG,
+    CONN_INFO
 } data_flag_t;
 
 /* Structs */

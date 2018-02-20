@@ -6,9 +6,11 @@
 //  Copyright © 2018 soroush. All rights reserved.
 //
 #include "util.h"
-#include <fcntl.h>
+
+#define FLAG_BUFF_SIZE 10
 
 int pending_flag = 0;
+sem_t *sig_sem;
 
 struct cl_arg_t {
     int socket;
@@ -27,14 +29,6 @@ void *client_process_stdin(struct cl_arg_t *arg)
         data_inf.data_flag = CONN_STDIN;
         if (socket_write_safe(sckt, &data_inf, buff, arg->writing_mutex)) {
             free(buff); close(sckt); exit(-4);
-        }
-        if (pending_flag) {
-            data_inf.data_flag = CONN_CMD_SIG;
-            data_inf.data_len = pending_flag;
-            pthread_mutex_lock(arg->writing_mutex);
-            if (sock_write(sckt, &data_inf, sizeof(conn_data_info_t))) {
-                free(buff); close(sckt); exit(-4);
-            }
         }
     }
     if (buff)
@@ -61,7 +55,28 @@ void *client_process_stdin(struct cl_arg_t *arg)
     return NULL;
 }
 
-int client_process_output(int sckt, int errfd)
+void *client_process_sig(struct cl_arg_t *arg)
+{
+    int sckt = arg->socket;
+    conn_data_info_t data_inf;
+    while (arg->keep_running) {
+        sem_wait(sig_sem);
+        printf("Sending Signal!!!\n");
+        if (pending_flag > 0) {
+            data_inf.data_flag = CONN_CMD_SIG;
+            data_inf.data_len = pending_flag;
+            pthread_mutex_lock(arg->writing_mutex);
+            if (sock_write(sckt, &data_inf, sizeof(conn_data_info_t))) {
+                pthread_mutex_unlock(arg->writing_mutex);
+                close(sckt); exit(-4);
+            }
+            pthread_mutex_unlock(arg->writing_mutex);
+        }
+    }
+    return NULL;
+}
+
+int client_process_output(int sckt, int errfd, pthread_mutex_t *writing_mutex)
 {
     /* Initialization */
     int err_stream_open = errfd >= 0, out_stream_open = 1, cmd_finished = 0;
@@ -91,10 +106,15 @@ int client_process_output(int sckt, int errfd)
                 if (err_stream_open)
                     close(errfd);
                 err_stream_open = 0;
+                break;
             
             case CONN_CMD_CLOSE:
                 cmd_finished = 1;
                 printf("CMD returned with %d\n", (int)data_inf.data_len);
+                break;
+                
+            case CONN_INFO:
+                socket_read_data(sckt, data_inf.data_len, STDOUT_FILENO);
                 break;
                 
             default:
@@ -104,6 +124,16 @@ int client_process_output(int sckt, int errfd)
         }
         if (cmd_finished)
             break;
+        if (!err_stream_open && !out_stream_open) {
+            pthread_mutex_lock(writing_mutex);
+            data_inf.data_flag = CONN_CMD_CLOSE;
+            data_inf.data_len = 0;
+            if (sock_write(sckt, &data_inf, sizeof(conn_data_info_t))) {
+                pthread_mutex_unlock(writing_mutex);
+                close(sckt); return (-4);
+            }
+            pthread_mutex_unlock(writing_mutex);
+        }
     }
     /*if (0 && read_len == 0) {
         err(1, "Connection Closed! (EOF Received!)");
@@ -116,6 +146,7 @@ int client_process_output(int sckt, int errfd)
 void handle_sig(int sig)
 {
     pending_flag = sig;
+    sem_post(sig_sem);
 }
 
 int client_routine(const char *addr, const char *port, const char *cmd, const char *stderr_fn)
@@ -154,17 +185,40 @@ int client_routine(const char *addr, const char *port, const char *cmd, const ch
     struct cl_arg_t stdin_arg = {sckt, 1, &writing_mutex};
     pthread_create(&stdin_proc, NULL, (void *(*)(void *))&client_process_stdin, &stdin_arg);
     
+    // Setup Signal Processing
+    char sem_name[100]; snprintf(sem_name, 100, "/q14cnt_%d", getpid());
+    sem_unlink(sem_name);
+    sig_sem = sem_open(sem_name, O_CREAT | O_EXCL, 700, 0);
+    pthread_t sig_proc = 0;
+    struct cl_arg_t sig_arg = {sckt, 1, &writing_mutex};
+    if (sig_sem != SEM_FAILED) {
+        pthread_create(&sig_proc, NULL, (void *(*)(void *))&client_process_sig, &sig_arg);
+        
+        signal(SIGINT, &handle_sig);
+        signal(SIGHUP, &handle_sig);
+        signal(SIGUSR1, &handle_sig);
+        signal(SIGUSR2, &handle_sig);
+    } else {
+        fprintf(stderr, "Couldn't Setup the Signal Processing!\n");
+    }
+    
     // Start read processing
-    int retval = client_process_output(sckt, errfd);
+    int retval = client_process_output(sckt, errfd, &writing_mutex);
     
     // Exit procedure
+    pthread_cancel(stdin_proc);
+    if (sig_sem != SEM_FAILED)
+        pthread_cancel(sig_proc);
+    /*
     if (pthread_mutex_trylock(&writing_mutex)) {
         stdin_arg.keep_running = 0;
         pthread_join(stdin_proc, NULL);
+        sig_arg.keep_running = 0;
+        
     } else {
         pthread_cancel(stdin_proc);
         pthread_mutex_unlock(&writing_mutex);
-    }
+    }*/
     
     if (retval)
         err(2, "Connection Read Error with code: %d, ", errno);

@@ -8,8 +8,6 @@
 
 #include "util.h"
 #include <sys/wait.h>
-#include <fcntl.h>
-#include <semaphore.h>
 
 /* Global variables */
 size_t free_threads[MAX_SIML_CONNS];
@@ -63,7 +61,8 @@ void server_process_input(serv_proc_args *arg)
                 break;
                 
             case CONN_CMD_SIG:
-                kill(arg->child, (int)data_inf.data_len);
+                printf("Received Signal\n");
+                killpg(arg->child, (int)data_inf.data_len);
                 break;
                 
             default:
@@ -120,6 +119,7 @@ void server_process_output(serv_proc_args *arg)
     if (read_len == 0) {
         data_inf.data_len = 0;
         data_inf.data_flag = arg->eof_type;
+        fprintf(stderr, "Sending EOF!!!\n");
         if (socket_write_safe(sckt, &data_inf, NULL, arg->mutex) < 0) {
             *(arg->is_running) = 0;
             sem_post(arg->end_proc);
@@ -148,7 +148,7 @@ void serv_request(struct serv_args *arg)
     pthread_mutex_init(req_mutex, NULL);
     
     // Setup the semaphore
-    char sem_name[100]; snprintf(sem_name, 100, "/Q14_Server_%d_%zull", getpid(), arg->thread_num);
+    char sem_name[100]; snprintf(sem_name, 100, "/q14%dt%d", getpid(), (int)arg->thread_num);
     sem_t *end_proc = arg->end_proc;
     
     conn_data_info_t start_req;
@@ -244,7 +244,7 @@ void serv_request(struct serv_args *arg)
     /* Setup socket -> pipline threads */
     // STDIN
     pthread_t stdin_proc; int in_is_running = 1;
-    serv_proc_args stdin_arg; stdin_arg.mutex = req_mutex; stdin_arg.is_running = &in_is_running; stdin_arg.child = child_pid;
+    serv_proc_args stdin_arg; stdin_arg.mutex = req_mutex; stdin_arg.is_running = &in_is_running; stdin_arg.child = pgrp;
     stdin_arg.socket = sckt; stdin_arg.pipe = stdin_pipe[1]; stdin_arg.end_proc = end_proc;
     pthread_create(&stdin_proc, NULL, (void *(*)(void *))&server_process_input, &stdin_arg);
     
@@ -323,7 +323,7 @@ void serv_request(struct serv_args *arg)
         const char *stat = "CMD Didn't stop on its own, so it was killed!\n";
         conn_data_info_t close_req;
         close_req.data_len = sizeof(stat);
-        close_req.data_flag = CONN_STDOUT;
+        close_req.data_flag = CONN_INFO;
         socket_write_safe(sckt, &close_req, stat, req_mutex);
         close_req.data_len = -1;
         close_req.data_flag = CONN_CMD_CLOSE;
@@ -337,7 +337,7 @@ void serv_request(struct serv_args *arg)
         const char *stat = "CMD has been stopped due to signal\n";
         conn_data_info_t close_req;
         close_req.data_len = sizeof(stat);
-        close_req.data_flag = CONN_STDOUT;
+        close_req.data_flag = CONN_INFO;
         socket_write_safe(sckt, &close_req, stat, req_mutex);
         close_req.data_len = WTERMSIG(status);
         close_req.data_flag = CONN_CMD_CLOSE;
@@ -347,7 +347,7 @@ void serv_request(struct serv_args *arg)
         const char *stat = "CMD has stopped and so it was killed it!\n";
         conn_data_info_t close_req;
         close_req.data_len = sizeof(stat);
-        close_req.data_flag = CONN_STDOUT;
+        close_req.data_flag = CONN_INFO;
         socket_write_safe(sckt, &close_req, stat, req_mutex);
         close_req.data_len = -1;
         close_req.data_flag = CONN_CMD_CLOSE;
@@ -374,6 +374,7 @@ Thread_Exit:;
 
 void server_stop(int sig)
 {
+    write(STDERR_FILENO, "KILLED WITH SIG", strlen("KILLED WITH SIG"));
     if (main_socket > 0)
         close(main_socket);
 }
@@ -404,7 +405,7 @@ int server_routine(const char *addr, const char *port)
     }
     for (size_t i = 0; i < MAX_SIML_CONNS; i++)
         free_threads[i] = i;
-    char sem_name[100]; snprintf(sem_name, 100, "/q14_server_threads_sem_%d", getpid());
+    char sem_name[100]; snprintf(sem_name, 100, "/q14sem%d", getpid());
     int res = sem_unlink(sem_name);
     if ((res < 0 && errno == ENOENT) || res == 0)
         thread_available = sem_open(sem_name, O_CREAT | O_EXCL, 700, MAX_SIML_CONNS);
@@ -444,12 +445,12 @@ int server_routine(const char *addr, const char *port)
             pthread_join(*thread_place, NULL);
             //free(*thread_place);
         }
-        char sem_name[100]; snprintf(sem_name, 100, "/q14_server_sem_%d_%d", getpid(), (int)arg->thread_num);
-        int res = sem_unlink(sem_name);
-        fprintf(stderr, sem_name);
-        fprintf(stderr, "HEllp %d\n", errno);
+        char sem_name_t[100]; snprintf(sem_name_t, 100, "/q14%dt%d", getpid(), (int)arg->thread_num);
+        int res = sem_unlink(sem_name_t);
+        //fprintf(stderr, sem_name);
+        //fprintf(stderr, "HEllp %d\n", errno);
         if ((res < 0 && errno != EACCES) || res == 0) {
-            threads_info[arg->thread_num].end_proc = sem_open(sem_name, O_CREAT | O_EXCL, S_IRUSR | S_IWUSR, 0);
+            threads_info[arg->thread_num].end_proc = sem_open(sem_name_t, O_CREAT | O_EXCL, S_IRUSR | S_IWUSR, 0);
             perror("HEllp ");
         }
         
@@ -457,12 +458,13 @@ int server_routine(const char *addr, const char *port)
             *thread_place = 0;
             fprintf(stderr, "Couldn't Open Semaphore for thread No.: %zu.", arg->thread_num);
             perror("Error ");
-            sem_unlink(sem_name);
+            sem_unlink(sem_name_t);
             
             free_threads_ptr -= 1;
             pthread_mutex_unlock(&free_thread_mutex);
             continue;
         }
+        arg->end_proc = threads_info[arg->thread_num].end_proc;
         
         printf("Creating Thread with No.: %zul\n", arg->thread_num);
         pthread_create(thread_place , NULL, (void *(*)(void *))&serv_request, (void *)arg);
@@ -487,7 +489,7 @@ int server_routine(const char *addr, const char *port)
             if (threads_info[i].thread_id)
                 pthread_cancel(threads_info[i].thread_id);
         sem_close(threads_info[i].end_proc);
-        snprintf(sem_name, 100, "/Q14_Server_%d_%zull", getpid(), i);
+        snprintf(sem_name, 100, "/q14%dt%d", getpid(), (int)i);
         sem_unlink(sem_name);
     }
     
